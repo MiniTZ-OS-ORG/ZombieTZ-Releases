@@ -60,3 +60,5 @@ jobs:
           name: ZombieTZ-clean-source-verification-c35d317
           path: CLEAN_SOURCE_VERIFIED.txt
           retention-days: 90
+
+# Reverification trigger: 2026-10-21; verify preserved source bundle SHA, commit identity, repository integrity and Unreal project layout.
