@@ -97,6 +97,45 @@ jobs:
           echo "RUNTIME_SMOKE_FAIL: launcher exit=$rc without the required engine startup/soak evidence."
           exit 1
 
+      - name: Validate Demo 01 gameplay behavior signals from runtime log
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"
+          test -s "$log" || { echo "BEHAVIOR_EVIDENCE_FAIL: runtime.log is missing"; exit 1; }
+          required=(
+            GAME_INSTANCE_READY WORLD_READY PLAYER_LOGIN SAFE_SPAWN ARENA_READY
+            NAVIGATION_READY INFECTED_GROUP_READY INFECTED_READY INFECTED_SPAWN
+            RIVAL_READY RIVAL_SPAWN MODE_READY PLAYER_PAWN_READY CAMERA_READY
+            AIM_READY INPUT_READY LOCOMOTION_READY WEAPON_READY CONTROLLER_READY
+            INFECTED_AGGRO INFECTED_CHASE RIVAL_TARGET DAMAGE HIT_REACTION
+            COMBAT_FEEDBACK RIVAL_FIRE DEFEAT PLAYER_FAILURE
+          )
+          {
+            echo "schema=zombietz.runtime_behavior_evidence/v1"
+            echo "release_tag=demo01-rtx-20261004-c35d317"
+            echo "renderer=NullRHI"
+            echo "visual_or_hardware_gpu_qualification=false"
+            echo "runtime_log_sha256=$(sha256sum "$log" | cut -d' ' -f1)"
+          } > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/behavior-acceptance.txt"
+          : > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/behavior-signals.txt"
+          missing=()
+          for signal in "${required[@]}"; do
+            count=$(grep -F -c "D01_SIGNAL ${signal} " "$log" || true)
+            if [[ "$count" -lt 1 ]]; then
+              printf '%s=missing\n' "$signal" | tee -a "$GITHUB_WORKSPACE/zombietz-smoke-artifact/behavior-signals.txt"
+              missing+=("$signal")
+            else
+              printf '%s=count:%s\n' "$signal" "$count" | tee -a "$GITHUB_WORKSPACE/zombietz-smoke-artifact/behavior-signals.txt"
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            echo "BEHAVIOR_EVIDENCE_FAIL: required signals missing: ${missing[*]}"
+            exit 1
+          fi
+          echo "BEHAVIOR_EVIDENCE_PASS: ${#required[@]} expected gameplay signals observed. NullRHI only; no visual/GPU claim."
+          printf 'behavior_signal_count=%s\n' "${#required[@]}" >> "$GITHUB_WORKSPACE/zombietz-smoke-artifact/behavior-acceptance.txt"
+
       - name: Upload package and runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
