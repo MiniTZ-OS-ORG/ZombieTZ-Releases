@@ -1,0 +1,108 @@
+name: Verify ZombieTZ packaged Linux runtime
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-demo01-linux-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-linux-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PACKAGE_NAME: ZombieTZ-Demo01-Linux-20261004T145552Z.tar
+      PACKAGE_SHA256: 31bc49d600a20c7699dc8e826aa3619cb4599967ab074f5c67c32c9f681376e3
+      PACKAGE_URL: https://github.com/MiniTZ-OS-ORG/ZombieTZ-Releases/releases/download/demo01-rtx-20261004-c35d317/ZombieTZ-Demo01-Linux-20261004T145552Z.tar
+    steps:
+      - name: Prepare evidence directory
+        run: mkdir -p zombietz-smoke-artifact
+
+      - name: Download and verify the exact release package
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1800 -o "$PACKAGE_NAME" "$PACKAGE_URL"
+          echo "$PACKAGE_SHA256  $PACKAGE_NAME" | sha256sum -c -
+          tar -tf "$PACKAGE_NAME" > zombietz-smoke-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames.sh' zombietz-smoke-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames/Binaries/Linux/BiellaGames' zombietz-smoke-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames/Content/Paks/BiellaGames-Linux.pak' zombietz-smoke-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames/Content/Paks/BiellaGames-Linux.utoc' zombietz-smoke-artifact/package-list.txt
+          cp "$PACKAGE_NAME" zombietz-smoke-artifact/package.sha256-source.tar
+          printf '%s\n' "$PACKAGE_SHA256" > zombietz-smoke-artifact/expected-package-sha256.txt
+
+      - name: Install virtual-display and software Vulkan runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libx11-6 libxext6 libxrender1 libxi6 libxrandr2 libxinerama1 libxcursor1 \
+            libxfixes3 libxcomposite1 libasound2t64 libfreetype6 libfontconfig1 \
+            libglib2.0-0 libssl3 libstdc++6 libgcc-s1 libxkbcommon0 libdrm2 libxcb1 libatomic1
+
+      - name: Extract package and inspect executable dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zombietz-package"
+          tar --extract --file "$PACKAGE_NAME" --directory "$RUNNER_TEMP/zombietz-package" --no-same-owner
+          cd "$RUNNER_TEMP/zombietz-package/package/Linux"
+          test -f BiellaGames.sh
+          test -f BiellaGames/Binaries/Linux/BiellaGames
+          test -f BiellaGames/Content/Paks/BiellaGames-Linux.pak
+          chmod +x BiellaGames/Binaries/Linux/BiellaGames
+          file BiellaGames/Binaries/Linux/BiellaGames | tee "$GITHUB_WORKSPACE/zombietz-smoke-artifact/executable-file.txt"
+          ldd BiellaGames/Binaries/Linux/BiellaGames > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/ldd.txt" 2>&1
+          if grep -q 'not found' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/ldd.txt"; then
+            echo "Missing runtime shared libraries; see ldd.txt"
+            exit 1
+          fi
+          cp BiellaGames/Manifest*.txt "$GITHUB_WORKSPACE/zombietz-smoke-artifact/" || true
+          { echo "commit_or_release_tag=demo01-rtx-20261004-c35d317"; echo "package_sha256=$(sha256sum "$GITHUB_WORKSPACE/$PACKAGE_NAME" | cut -d' ' -f1)"; echo "runner_os=$(uname -a)"; echo "gpu_devices=$(ls /dev/dri 2>/dev/null | paste -sd, - || true)"; } > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/environment.txt"
+          vulkaninfo --summary > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/vulkan-summary.txt" 2>&1 || true
+
+      - name: Launch packaged game for a 120-second software-rendered smoke
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$RUNNER_TEMP/zombietz-package/package/Linux"
+          set +e
+          timeout --signal=TERM --kill-after=15s 120s xvfb-run -a env \
+            LIBGL_ALWAYS_SOFTWARE=1 \
+            ./BiellaGames.sh -windowed -ResX=960 -ResY=540 -unattended -nosplash -NoSound \
+            -abslog="$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"
+          rc=$?
+          set -e
+          echo "$rc" > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/launch-exit-code.txt"
+          if [[ -f "$RUNNER_TEMP/zombietz-package/package/Linux/BiellaGames/Saved/Logs/BiellaGames.log" ]]; then
+            cp "$RUNNER_TEMP/zombietz-package/package/Linux/BiellaGames/Saved/Logs/BiellaGames.log" "$GITHUB_WORKSPACE/zombietz-smoke-artifact/"
+          fi
+          if [[ -f "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log" ]]; then
+            tail -n 250 "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"
+          fi
+          if grep -Eqi 'Fatal error|Failed to initialize Vulkan|Failed to create.*RHI|Could not create Vulkan|Assertion failed' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log" 2>/dev/null; then
+            echo "Runtime reached a fatal engine/RHI error; smoke failed."
+            exit 1
+          fi
+          if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+            if grep -Eqi 'LogInit: Engine Version|LogInit: Build|LogConfig: Applying CVar settings|LogCore: Engine' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"; then
+              echo "RUNTIME_SMOKE_PASS: process remained alive for the 120-second window and emitted engine startup evidence."
+              exit 0
+            fi
+          fi
+          if [[ "$rc" -eq 0 ]] && grep -Eqi 'LogInit: Engine Version|LogInit: Build|LogCore: Engine' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"; then
+            echo "RUNTIME_SMOKE_PASS: process exited cleanly with engine startup evidence."
+            exit 0
+          fi
+          echo "RUNTIME_SMOKE_FAIL: launcher exit=$rc without the required engine startup/soak evidence."
+          exit 1
+
+      - name: Upload package and runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zombietz-demo01-linux-runtime-smoke
+          path: zombietz-smoke-artifact/
+          if-no-files-found: warn
+          retention-days: 90
