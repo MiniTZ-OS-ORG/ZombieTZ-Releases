@@ -1,0 +1,114 @@
+name: Verify ZombieTZ packaged Linux software-Vulkan RHI
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-demo01-software-vulkan.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  software-vulkan-rhi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PACKAGE_NAME: ZombieTZ-Demo01-Linux-20261004T145552Z.tar
+      PACKAGE_SHA256: 31bc49d600a20c7699dc8e826aa3619cb4599967ab074f5c67c32c9f681376e3
+      PACKAGE_URL: https://github.com/MiniTZ-OS-ORG/ZombieTZ-Releases/releases/download/demo01-rtx-20261004-c35d317/ZombieTZ-Demo01-Linux-20261004T145552Z.tar
+    steps:
+      - name: Prepare evidence directory
+        run: mkdir -p zombietz-software-vulkan-artifact
+
+      - name: Download and verify the exact release package
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1800 -o "$PACKAGE_NAME" "$PACKAGE_URL"
+          echo "$PACKAGE_SHA256  $PACKAGE_NAME" | sha256sum -c -
+          tar -tf "$PACKAGE_NAME" > zombietz-software-vulkan-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames.sh' zombietz-software-vulkan-artifact/package-list.txt
+          grep -Fx 'package/Linux/BiellaGames/Binaries/Linux/BiellaGames' zombietz-software-vulkan-artifact/package-list.txt
+          printf '%s\n' "$PACKAGE_SHA256" > zombietz-software-vulkan-artifact/expected-package-sha256.txt
+
+      - name: Install virtual display and software Vulkan runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libx11-6 libxext6 libxrender1 libxi6 libxrandr2 libxinerama1 libxcursor1 \
+            libxfixes3 libxcomposite1 libasound2t64 libfreetype6 libfontconfig1 \
+            libglib2.0-0 libssl3 libstdc++6 libgcc-s1 libxkbcommon0 libdrm2 libxcb1 libatomic1
+          {
+            echo "runner_os=$(uname -a)"
+            echo "vulkan_icd_files=$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -printf '%f,' 2>/dev/null || true)"
+          } > zombietz-software-vulkan-artifact/environment.txt
+          vulkaninfo --summary > zombietz-software-vulkan-artifact/vulkan-summary.txt 2>&1 || true
+
+      - name: Extract package and inspect dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zombietz-package"
+          tar --extract --file "$PACKAGE_NAME" --directory "$RUNNER_TEMP/zombietz-package" --no-same-owner
+          cd "$RUNNER_TEMP/zombietz-package/package/Linux"
+          test -f BiellaGames.sh
+          test -f BiellaGames/Binaries/Linux/BiellaGames
+          test -f BiellaGames/Content/Paks/BiellaGames-Linux.pak
+          chmod +x BiellaGames/Binaries/Linux/BiellaGames
+          file BiellaGames/Binaries/Linux/BiellaGames | tee "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/executable-file.txt"
+          ldd BiellaGames/Binaries/Linux/BiellaGames > "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/ldd.txt" 2>&1
+          if grep -q 'not found' "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/ldd.txt"; then
+            echo "Missing runtime shared libraries; see ldd.txt"
+            exit 1
+          fi
+          cp BiellaGames/Manifest*.txt "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/" || true
+
+      - name: Launch packaged game with software Vulkan for a 90-second RHI soak
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$RUNNER_TEMP/zombietz-package/package/Linux"
+          set +e
+          timeout --signal=TERM --kill-after=15s 90s xvfb-run -a env \
+            LIBGL_ALWAYS_SOFTWARE=1 \
+            ./BiellaGames.sh -vulkan -unattended -nosplash -NoSound -windowed -ResX=1280 -ResY=720 \
+            -abslog="$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log"
+          rc=$?
+          set -e
+          echo "$rc" > "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/launch-exit-code.txt"
+          if [[ -f "$RUNNER_TEMP/zombietz-package/package/Linux/BiellaGames/Saved/Logs/BiellaGames.log" ]]; then
+            cp "$RUNNER_TEMP/zombietz-package/package/Linux/BiellaGames/Saved/Logs/BiellaGames.log" "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/"
+          fi
+          if [[ -f "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log" ]]; then
+            tail -n 300 "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log"
+          fi
+          if grep -Eqi 'Fatal error|Failed to initialize Vulkan|Failed to create.*RHI|Could not create Vulkan|Assertion failed|No supported RHI' "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log" 2>/dev/null; then
+            echo "SOFTWARE_VULKAN_RHI_FAIL: fatal Vulkan/RHI startup error; no rendering qualification."
+            exit 1
+          fi
+          if ! grep -Eqi 'LogInit: Engine Version|LogInit: Build|LogCore: Engine' "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log" 2>/dev/null; then
+            echo "SOFTWARE_VULKAN_RHI_FAIL: engine startup evidence missing."
+            exit 1
+          fi
+          if ! grep -Eqi 'LogVulkanRHI|VulkanRHI|LogRHI: Display' "$GITHUB_WORKSPACE/zombietz-software-vulkan-artifact/runtime.log" 2>/dev/null; then
+            echo "SOFTWARE_VULKAN_RHI_FAIL: no Vulkan/RHI initialization evidence."
+            exit 1
+          fi
+          if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+            echo "SOFTWARE_VULKAN_RHI_PASS: non-NullRHI engine remained alive for 90 seconds with Vulkan/RHI evidence. This is software-renderer CI only, not physical-GPU or visual-acceptance proof."
+            exit 0
+          fi
+          if [[ "$rc" -eq 0 ]]; then
+            echo "SOFTWARE_VULKAN_RHI_PASS: non-NullRHI engine exited cleanly with Vulkan/RHI evidence. This is software-renderer CI only, not physical-GPU or visual-acceptance proof."
+            exit 0
+          fi
+          echo "SOFTWARE_VULKAN_RHI_FAIL: launcher exit=$rc without successful soak."
+          exit 1
+
+      - name: Upload runtime evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zombietz-demo01-software-vulkan-rhi
+          path: zombietz-software-vulkan-artifact/
+          if-no-files-found: warn
+          retention-days: 90
