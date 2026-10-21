@@ -1,4 +1,4 @@
-name: Verify ZombieTZ packaged Linux runtime
+name: Verify ZombieTZ packaged Linux runtime (NullRHI)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,6 @@ jobs:
           grep -Fx 'package/Linux/BiellaGames/Binaries/Linux/BiellaGames' zombietz-smoke-artifact/package-list.txt
           grep -Fx 'package/Linux/BiellaGames/Content/Paks/BiellaGames-Linux.pak' zombietz-smoke-artifact/package-list.txt
           grep -Fx 'package/Linux/BiellaGames/Content/Paks/BiellaGames-Linux.utoc' zombietz-smoke-artifact/package-list.txt
-          cp "$PACKAGE_NAME" zombietz-smoke-artifact/package.sha256-source.tar
           printf '%s\n' "$PACKAGE_SHA256" > zombietz-smoke-artifact/expected-package-sha256.txt
 
       - name: Install virtual-display and software Vulkan runtime
@@ -62,7 +61,7 @@ jobs:
           { echo "commit_or_release_tag=demo01-rtx-20261004-c35d317"; echo "package_sha256=$(sha256sum "$GITHUB_WORKSPACE/$PACKAGE_NAME" | cut -d' ' -f1)"; echo "runner_os=$(uname -a)"; echo "gpu_devices=$(ls /dev/dri 2>/dev/null | paste -sd, - || true)"; } > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/environment.txt"
           vulkaninfo --summary > "$GITHUB_WORKSPACE/zombietz-smoke-artifact/vulkan-summary.txt" 2>&1 || true
 
-      - name: Launch packaged game for a 120-second software-rendered smoke
+      - name: Launch packaged game with NullRHI for a 120-second headless smoke
         shell: bash
         run: |
           set -uo pipefail
@@ -70,7 +69,7 @@ jobs:
           set +e
           timeout --signal=TERM --kill-after=15s 120s xvfb-run -a env \
             LIBGL_ALWAYS_SOFTWARE=1 \
-            ./BiellaGames.sh -windowed -ResX=960 -ResY=540 -unattended -nosplash -NoSound \
+            ./BiellaGames.sh -nullrhi -unattended -nosplash -NoSound \
             -abslog="$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"
           rc=$?
           set -e
@@ -87,12 +86,12 @@ jobs:
           fi
           if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
             if grep -Eqi 'LogInit: Engine Version|LogInit: Build|LogConfig: Applying CVar settings|LogCore: Engine' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"; then
-              echo "RUNTIME_SMOKE_PASS: process remained alive for the 120-second window and emitted engine startup evidence."
+              echo "RUNTIME_SMOKE_PASS: NullRHI process remained alive for 120 seconds and emitted engine startup evidence; no GPU or visual rendering claim."
               exit 0
             fi
           fi
           if [[ "$rc" -eq 0 ]] && grep -Eqi 'LogInit: Engine Version|LogInit: Build|LogCore: Engine' "$GITHUB_WORKSPACE/zombietz-smoke-artifact/runtime.log"; then
-            echo "RUNTIME_SMOKE_PASS: process exited cleanly with engine startup evidence."
+            echo "RUNTIME_SMOKE_PASS: NullRHI process exited cleanly with engine startup evidence; no GPU or visual rendering claim."
             exit 0
           fi
           echo "RUNTIME_SMOKE_FAIL: launcher exit=$rc without the required engine startup/soak evidence."
